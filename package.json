@@ -1,0 +1,30 @@
+{
+  "name": "esl-flashcard-app",
+  "version": "1.0.0",
+  "description": "World-class ESL flashcard app with spaced repetition, visual learning, and AI-powered features",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "backend"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:backend": "npm run dev --workspace=backend",
+    "build": "npm run build --workspaces",
+    "build:frontend": "npm run build --workspace=frontend",
+    "build:backend": "npm run build --workspace=backend",
+    "type-check": "npm run type-check --workspaces",
+    "lint": "npm run lint --workspaces"
+  },
+  "keywords": [
+    "flashcard",
+    "esl",
+    "spaced-repetition",
+    "language-learning",
+    "edtech"
+  ],
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
