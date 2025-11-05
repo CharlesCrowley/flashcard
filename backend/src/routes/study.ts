@@ -1,11 +1,11 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { db, cards, reviews, studySessions, decks } from '../db';
+import { eq, lte, and, desc, asc, count, sum, sql } from 'drizzle-orm';
 import { fsrsService } from '../services/fsrs.service';
 import { Rating } from 'fsrs';
 import { z } from 'zod';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 // Validation schemas
 const reviewSchema = z.object({
@@ -20,40 +20,37 @@ router.get('/due', async (req: Request, res: Response) => {
   try {
     const { deckId, limit = '20' } = req.query;
 
-    const where: any = {
-      due: {
-        lte: new Date(),
-      },
-    };
+    const conditions = [
+      lte(cards.due, new Date()),
+    ];
 
     if (deckId) {
-      where.deckId = deckId as string;
+      conditions.push(eq(cards.deckId, deckId as string));
     }
 
-    const cards = await prisma.card.findMany({
-      where,
-      include: {
+    const dueCards = await db
+      .select({
+        card: cards,
         deck: {
-          select: {
-            id: true,
-            name: true,
-          },
+          id: decks.id,
+          name: decks.name,
         },
-      },
-      orderBy: [
-        { due: 'asc' }, // Cards most overdue first
-        { state: 'asc' }, // New cards before review cards
-      ],
-      take: parseInt(limit as string),
-    });
+      })
+      .from(cards)
+      .leftJoin(decks, eq(cards.deckId, decks.id))
+      .where(and(...conditions))
+      .orderBy(asc(cards.due), asc(cards.state))
+      .limit(parseInt(limit as string));
 
     // For each card, calculate next review options
-    const cardsWithOptions = cards.map(card => {
+    const cardsWithOptions = dueCards.map((row) => {
+      const card = row.card;
       const fsrsCard = fsrsService.toFSRSCard(card);
       const options = fsrsService.getReviewOptions(fsrsCard);
 
       return {
         ...card,
+        deck: row.deck,
         nextReview: {
           again: {
             interval: Math.round(options.again.card.scheduled_days),
@@ -77,7 +74,7 @@ router.get('/due', async (req: Request, res: Response) => {
 
     res.json({
       cards: cardsWithOptions,
-      total: cards.length,
+      total: cardsWithOptions.length,
     });
   } catch (error) {
     console.error('Error fetching due cards:', error);
@@ -91,9 +88,11 @@ router.post('/review', async (req: Request, res: Response) => {
     const { cardId, userId, rating, timeSpent } = reviewSchema.parse(req.body);
 
     // Get current card state
-    const card = await prisma.card.findUnique({
-      where: { id: cardId },
-    });
+    const [card] = await db
+      .select()
+      .from(cards)
+      .where(eq(cards.id, cardId))
+      .limit(1);
 
     if (!card) {
       return res.status(404).json({ error: 'Card not found' });
@@ -105,21 +104,23 @@ router.post('/review', async (req: Request, res: Response) => {
     const updatedFsrsData = fsrsService.fromFSRSCard(nextReview.card);
 
     // Update card in database
-    const updatedCard = await prisma.card.update({
-      where: { id: cardId },
-      data: updatedFsrsData,
-    });
+    const [updatedCard] = await db
+      .update(cards)
+      .set(updatedFsrsData)
+      .where(eq(cards.id, cardId))
+      .returning();
 
     // Create review record
-    const review = await prisma.review.create({
-      data: {
+    const [review] = await db
+      .insert(reviews)
+      .values({
         cardId,
         userId,
         rating,
         timeSpent,
         reviewedAt: new Date(),
-      },
-    });
+      })
+      .returning();
 
     res.json({
       card: updatedCard,
@@ -145,32 +146,43 @@ router.get('/stats', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const where: any = { userId: userId as string };
-    if (deckId) where.card = { deckId: deckId as string };
+    // Build conditions for reviews query
+    const reviewConditions = [eq(reviews.userId, userId as string)];
 
-    // Get review statistics
-    const reviews = await prisma.review.findMany({
-      where,
-      include: {
-        card: {
-          select: {
-            deckId: true,
-            word: true,
-          },
-        },
-      },
-    });
+    // Get all reviews for the user
+    const userReviews = await db
+      .select({
+        id: reviews.id,
+        cardId: reviews.cardId,
+        rating: reviews.rating,
+        reviewedAt: reviews.reviewedAt,
+        timeSpent: reviews.timeSpent,
+      })
+      .from(reviews)
+      .where(and(...reviewConditions));
+
+    // Filter by deck if provided
+    let filteredReviews = userReviews;
+    if (deckId) {
+      const deckCardIds = await db
+        .select({ id: cards.id })
+        .from(cards)
+        .where(eq(cards.deckId, deckId as string));
+
+      const deckCardIdSet = new Set(deckCardIds.map(c => c.id));
+      filteredReviews = userReviews.filter(r => deckCardIdSet.has(r.cardId));
+    }
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const todayReviews = reviews.filter(r => r.reviewedAt >= today);
+    const todayReviews = filteredReviews.filter(r => r.reviewedAt >= today);
 
     // Calculate statistics
     const stats = {
       total: {
-        reviews: reviews.length,
-        cards: new Set(reviews.map(r => r.cardId)).size,
+        reviews: filteredReviews.length,
+        cards: new Set(filteredReviews.map(r => r.cardId)).size,
       },
       today: {
         reviews: todayReviews.length,
@@ -178,24 +190,27 @@ router.get('/stats', async (req: Request, res: Response) => {
         timeSpent: todayReviews.reduce((sum, r) => sum + (r.timeSpent || 0), 0),
       },
       ratings: {
-        again: reviews.filter(r => r.rating === 1).length,
-        hard: reviews.filter(r => r.rating === 2).length,
-        good: reviews.filter(r => r.rating === 3).length,
-        easy: reviews.filter(r => r.rating === 4).length,
+        again: filteredReviews.filter(r => r.rating === 1).length,
+        hard: filteredReviews.filter(r => r.rating === 2).length,
+        good: filteredReviews.filter(r => r.rating === 3).length,
+        easy: filteredReviews.filter(r => r.rating === 4).length,
       },
-      averageRating: reviews.length > 0
-        ? reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length
+      averageRating: filteredReviews.length > 0
+        ? filteredReviews.reduce((sum, r) => sum + r.rating, 0) / filteredReviews.length
         : 0,
     };
 
     // Get cards by state
-    const cardWhere: any = {};
-    if (deckId) cardWhere.deckId = deckId as string;
+    const cardConditions = [];
+    if (deckId) cardConditions.push(eq(cards.deckId, deckId as string));
 
-    const allCards = await prisma.card.findMany({
-      where: cardWhere,
-      select: { state: true, due: true },
-    });
+    const allCards = await db
+      .select({
+        state: cards.state,
+        due: cards.due,
+      })
+      .from(cards)
+      .where(cardConditions.length > 0 ? and(...cardConditions) : undefined);
 
     const cardStats = {
       new: allCards.filter(c => c.state === 0).length,
@@ -224,12 +239,13 @@ router.post('/session/start', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'userId is required' });
     }
 
-    const session = await prisma.studySession.create({
-      data: {
+    const [session] = await db
+      .insert(studySessions)
+      .values({
         userId,
         startedAt: new Date(),
-      },
-    });
+      })
+      .returning();
 
     res.json(session);
   } catch (error) {
@@ -247,9 +263,11 @@ router.post('/session/end', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'sessionId is required' });
     }
 
-    const session = await prisma.studySession.findUnique({
-      where: { id: sessionId },
-    });
+    const [session] = await db
+      .select()
+      .from(studySessions)
+      .where(eq(studySessions.id, sessionId))
+      .limit(1);
 
     if (!session) {
       return res.status(404).json({ error: 'Session not found' });
@@ -258,14 +276,15 @@ router.post('/session/end', async (req: Request, res: Response) => {
     const endTime = new Date();
     const duration = Math.floor((endTime.getTime() - session.startedAt.getTime()) / 1000);
 
-    const updatedSession = await prisma.studySession.update({
-      where: { id: sessionId },
-      data: {
+    const [updatedSession] = await db
+      .update(studySessions)
+      .set({
         endedAt: endTime,
         duration,
         cardsStudied: cardsStudied || 0,
-      },
-    });
+      })
+      .where(eq(studySessions.id, sessionId))
+      .returning();
 
     res.json(updatedSession);
   } catch (error) {

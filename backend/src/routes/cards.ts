@@ -1,16 +1,16 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { db, cards, decks, reviews } from '../db';
+import { eq, and, ilike, or, desc, sql } from 'drizzle-orm';
 import { fsrsService } from '../services/fsrs.service';
 import { z } from 'zod';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 // Validation schemas
 const createCardSchema = z.object({
   deckId: z.string().uuid(),
   word: z.string().min(1),
-  definition: z.string().optional(),
+  definition: z.string().default(''),
   pronunciation: z.string().optional(),
   audioUrl: z.string().url().optional(),
   imageUrl: z.string().url().optional(),
@@ -28,30 +28,67 @@ router.get('/', async (req: Request, res: Response) => {
   try {
     const { deckId, tag, search } = req.query;
 
-    const where: any = {};
-    if (deckId) where.deckId = deckId as string;
-    if (tag) where.tags = { has: tag as string };
+    let query = db
+      .select({
+        id: cards.id,
+        deckId: cards.deckId,
+        word: cards.word,
+        definition: cards.definition,
+        pronunciation: cards.pronunciation,
+        audioUrl: cards.audioUrl,
+        imageUrl: cards.imageUrl,
+        drawingData: cards.drawingData,
+        exampleSentences: cards.exampleSentences,
+        translation: cards.translation,
+        partOfSpeech: cards.partOfSpeech,
+        tags: cards.tags,
+        due: cards.due,
+        stability: cards.stability,
+        difficulty: cards.difficulty,
+        elapsedDays: cards.elapsedDays,
+        scheduledDays: cards.scheduledDays,
+        reps: cards.reps,
+        lapses: cards.lapses,
+        state: cards.state,
+        lastReview: cards.lastReview,
+        createdAt: cards.createdAt,
+        updatedAt: cards.updatedAt,
+        deckName: decks.name,
+        deckIdRef: decks.id,
+      })
+      .from(cards)
+      .leftJoin(decks, eq(cards.deckId, decks.id))
+      .$dynamic();
+
+    // Apply filters
+    const conditions = [];
+    if (deckId) conditions.push(eq(cards.deckId, deckId as string));
+    if (tag) conditions.push(sql`${tag} = ANY(${cards.tags})`);
     if (search) {
-      where.OR = [
-        { word: { contains: search as string, mode: 'insensitive' } },
-        { definition: { contains: search as string, mode: 'insensitive' } },
-      ];
+      conditions.push(
+        or(
+          ilike(cards.word, `%${search}%`),
+          ilike(cards.definition, `%${search}%`)
+        )!
+      );
     }
 
-    const cards = await prisma.card.findMany({
-      where,
-      include: {
-        deck: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-      },
-      orderBy: { createdAt: 'desc' },
+    if (conditions.length > 0) {
+      query = query.where(and(...conditions));
+    }
+
+    const result = await query.orderBy(desc(cards.createdAt));
+
+    // Transform results
+    const formattedCards = result.map((row) => {
+      const { deckName, deckIdRef, ...cardData } = row;
+      return {
+        ...cardData,
+        deck: deckName && deckIdRef ? { id: deckIdRef, name: deckName } : null,
+      };
     });
 
-    res.json(cards);
+    res.json(formattedCards);
   } catch (error) {
     console.error('Error fetching cards:', error);
     res.status(500).json({ error: 'Failed to fetch cards' });
@@ -63,22 +100,36 @@ router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    const card = await prisma.card.findUnique({
-      where: { id },
-      include: {
-        deck: true,
-        reviews: {
-          orderBy: { reviewedAt: 'desc' },
-          take: 10,
-        },
-      },
-    });
+    const [card] = await db
+      .select()
+      .from(cards)
+      .where(eq(cards.id, id))
+      .limit(1);
 
     if (!card) {
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    res.json(card);
+    // Get deck info
+    const [deckInfo] = await db
+      .select()
+      .from(decks)
+      .where(eq(decks.id, card.deckId))
+      .limit(1);
+
+    // Get recent reviews
+    const recentReviews = await db
+      .select()
+      .from(reviews)
+      .where(eq(reviews.cardId, id))
+      .orderBy(desc(reviews.reviewedAt))
+      .limit(10);
+
+    res.json({
+      ...card,
+      deck: deckInfo,
+      reviews: recentReviews,
+    });
   } catch (error) {
     console.error('Error fetching card:', error);
     res.status(500).json({ error: 'Failed to fetch card' });
@@ -94,17 +145,25 @@ router.post('/', async (req: Request, res: Response) => {
     const fsrsCard = fsrsService.createNewCard();
     const fsrsData = fsrsService.fromFSRSCard(fsrsCard);
 
-    const card = await prisma.card.create({
-      data: {
+    const [newCard] = await db
+      .insert(cards)
+      .values({
         ...data,
         ...fsrsData,
-      },
-      include: {
-        deck: true,
-      },
-    });
+      })
+      .returning();
 
-    res.status(201).json(card);
+    // Get deck info
+    const [deckInfo] = await db
+      .select()
+      .from(decks)
+      .where(eq(decks.id, newCard.deckId))
+      .limit(1);
+
+    res.status(201).json({
+      ...newCard,
+      deck: deckInfo,
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: 'Invalid input', details: error.errors });
@@ -120,15 +179,30 @@ router.put('/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const data = updateCardSchema.parse(req.body);
 
-    const card = await prisma.card.update({
-      where: { id },
-      data,
-      include: {
-        deck: true,
-      },
-    });
+    const [updatedCard] = await db
+      .update(cards)
+      .set({
+        ...data,
+        updatedAt: new Date(),
+      })
+      .where(eq(cards.id, id))
+      .returning();
 
-    res.json(card);
+    if (!updatedCard) {
+      return res.status(404).json({ error: 'Card not found' });
+    }
+
+    // Get deck info
+    const [deckInfo] = await db
+      .select()
+      .from(decks)
+      .where(eq(decks.id, updatedCard.deckId))
+      .limit(1);
+
+    res.json({
+      ...updatedCard,
+      deck: deckInfo,
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: 'Invalid input', details: error.errors });
@@ -143,9 +217,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    await prisma.card.delete({
-      where: { id },
-    });
+    await db.delete(cards).where(eq(cards.id, id));
 
     res.status(204).send();
   } catch (error) {
@@ -159,42 +231,43 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    const card = await prisma.card.findUnique({
-      where: { id },
-      select: {
-        reps: true,
-        lapses: true,
-        state: true,
-        due: true,
-        stability: true,
-        difficulty: true,
-      },
-    });
+    const [card] = await db
+      .select({
+        reps: cards.reps,
+        lapses: cards.lapses,
+        state: cards.state,
+        due: cards.due,
+        stability: cards.stability,
+        difficulty: cards.difficulty,
+      })
+      .from(cards)
+      .where(eq(cards.id, id))
+      .limit(1);
 
     if (!card) {
       return res.status(404).json({ error: 'Card not found' });
     }
 
-    const reviews = await prisma.review.findMany({
-      where: { cardId: id },
-      orderBy: { reviewedAt: 'asc' },
-      select: {
-        rating: true,
-        reviewedAt: true,
-        timeSpent: true,
-      },
-    });
+    const cardReviews = await db
+      .select({
+        rating: reviews.rating,
+        reviewedAt: reviews.reviewedAt,
+        timeSpent: reviews.timeSpent,
+      })
+      .from(reviews)
+      .where(eq(reviews.cardId, id))
+      .orderBy(reviews.reviewedAt);
 
     const stats = {
       ...card,
-      totalReviews: reviews.length,
-      averageRating: reviews.length > 0
-        ? reviews.reduce((sum, r) => sum + r.rating, 0) / reviews.length
+      totalReviews: cardReviews.length,
+      averageRating: cardReviews.length > 0
+        ? cardReviews.reduce((sum, r) => sum + r.rating, 0) / cardReviews.length
         : 0,
-      averageTimeSpent: reviews.length > 0
-        ? reviews.reduce((sum, r) => sum + (r.timeSpent || 0), 0) / reviews.length
+      averageTimeSpent: cardReviews.length > 0
+        ? cardReviews.reduce((sum, r) => sum + (r.timeSpent || 0), 0) / cardReviews.length
         : 0,
-      reviewHistory: reviews,
+      reviewHistory: cardReviews,
     };
 
     res.json(stats);

@@ -1,9 +1,9 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { db, decks, cards } from '../db';
+import { eq, desc, count } from 'drizzle-orm';
 import { z } from 'zod';
 
 const router = Router();
-const prisma = new PrismaClient();
 
 // Validation schemas
 const createDeckSchema = z.object({
@@ -19,21 +19,31 @@ router.get('/', async (req: Request, res: Response) => {
   try {
     const { userId } = req.query;
 
-    const where = userId ? { userId: userId as string } : {};
+    let query = db
+      .select({
+        deck: decks,
+        cardCount: count(cards.id),
+      })
+      .from(decks)
+      .leftJoin(cards, eq(decks.id, cards.deckId))
+      .groupBy(decks.id)
+      .$dynamic();
 
-    const decks = await prisma.deck.findMany({
-      where,
-      include: {
-        _count: {
-          select: {
-            cards: true,
-          },
-        },
+    if (userId) {
+      query = query.where(eq(decks.userId, userId as string));
+    }
+
+    const result = await query.orderBy(desc(decks.updatedAt));
+
+    // Transform results
+    const formattedDecks = result.map((row) => ({
+      ...row.deck,
+      _count: {
+        cards: row.cardCount,
       },
-      orderBy: { updatedAt: 'desc' },
-    });
+    }));
 
-    res.json(decks);
+    res.json(formattedDecks);
   } catch (error) {
     console.error('Error fetching decks:', error);
     res.status(500).json({ error: 'Failed to fetch decks' });
@@ -45,26 +55,31 @@ router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    const deck = await prisma.deck.findUnique({
-      where: { id },
-      include: {
-        cards: {
-          orderBy: { createdAt: 'desc' },
-          take: 100, // Limit for performance
-        },
-        _count: {
-          select: {
-            cards: true,
-          },
-        },
-      },
-    });
+    const [deck] = await db
+      .select()
+      .from(decks)
+      .where(eq(decks.id, id))
+      .limit(1);
 
     if (!deck) {
       return res.status(404).json({ error: 'Deck not found' });
     }
 
-    res.json(deck);
+    // Get cards in this deck
+    const deckCards = await db
+      .select()
+      .from(cards)
+      .where(eq(cards.deckId, id))
+      .orderBy(desc(cards.createdAt))
+      .limit(100);
+
+    res.json({
+      ...deck,
+      cards: deckCards,
+      _count: {
+        cards: deckCards.length,
+      },
+    });
   } catch (error) {
     console.error('Error fetching deck:', error);
     res.status(500).json({ error: 'Failed to fetch deck' });
@@ -76,18 +91,17 @@ router.post('/', async (req: Request, res: Response) => {
   try {
     const data = createDeckSchema.parse(req.body);
 
-    const deck = await prisma.deck.create({
-      data,
-      include: {
-        _count: {
-          select: {
-            cards: true,
-          },
-        },
+    const [newDeck] = await db
+      .insert(decks)
+      .values(data)
+      .returning();
+
+    res.status(201).json({
+      ...newDeck,
+      _count: {
+        cards: 0,
       },
     });
-
-    res.status(201).json(deck);
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: 'Invalid input', details: error.errors });
@@ -103,19 +117,31 @@ router.put('/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const data = updateDeckSchema.parse(req.body);
 
-    const deck = await prisma.deck.update({
-      where: { id },
-      data,
-      include: {
-        _count: {
-          select: {
-            cards: true,
-          },
-        },
+    const [updatedDeck] = await db
+      .update(decks)
+      .set({
+        ...data,
+        updatedAt: new Date(),
+      })
+      .where(eq(decks.id, id))
+      .returning();
+
+    if (!updatedDeck) {
+      return res.status(404).json({ error: 'Deck not found' });
+    }
+
+    // Get card count
+    const [{ cardCount }] = await db
+      .select({ cardCount: count(cards.id) })
+      .from(cards)
+      .where(eq(cards.deckId, id));
+
+    res.json({
+      ...updatedDeck,
+      _count: {
+        cards: cardCount,
       },
     });
-
-    res.json(deck);
   } catch (error) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({ error: 'Invalid input', details: error.errors });
@@ -130,9 +156,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    await prisma.deck.delete({
-      where: { id },
-    });
+    await db.delete(decks).where(eq(decks.id, id));
 
     res.status(204).send();
   } catch (error) {
@@ -146,17 +170,17 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
-    const cards = await prisma.card.findMany({
-      where: { deckId: id },
-      select: {
-        state: true,
-        due: true,
-        reps: true,
-        lapses: true,
-      },
-    });
+    const deckCards = await db
+      .select({
+        state: cards.state,
+        due: cards.due,
+        reps: cards.reps,
+        lapses: cards.lapses,
+      })
+      .from(cards)
+      .where(eq(cards.deckId, id));
 
-    if (cards.length === 0) {
+    if (deckCards.length === 0) {
       return res.json({
         total: 0,
         new: 0,
@@ -170,12 +194,12 @@ router.get('/:id/stats', async (req: Request, res: Response) => {
     const now = new Date();
 
     const stats = {
-      total: cards.length,
-      new: cards.filter(c => c.state === 0).length,
-      learning: cards.filter(c => c.state === 1).length,
-      review: cards.filter(c => c.state === 2).length,
-      due: cards.filter(c => c.due <= now).length,
-      mastery: cards.filter(c => c.reps >= 5 && c.lapses === 0).length,
+      total: deckCards.length,
+      new: deckCards.filter(c => c.state === 0).length,
+      learning: deckCards.filter(c => c.state === 1).length,
+      review: deckCards.filter(c => c.state === 2).length,
+      due: deckCards.filter(c => c.due <= now).length,
+      mastery: deckCards.filter(c => c.reps >= 5 && c.lapses === 0).length,
     };
 
     res.json(stats);
