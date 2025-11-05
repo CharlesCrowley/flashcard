@@ -24,15 +24,15 @@ A world-class flashcard application for ESL students featuring spaced repetition
 ### Backend
 - Node.js + Express
 - TypeScript
-- PostgreSQL (or SQLite for development)
-- Prisma ORM
-- FSRS algorithm (ts-fsrs)
+- Neon Serverless PostgreSQL
+- Drizzle ORM
+- FSRS algorithm (fsrs npm package)
 
 ## Getting Started
 
 ### Prerequisites
 - Node.js 18+
-- PostgreSQL (or SQLite for development)
+- Neon PostgreSQL database (free tier available at [neon.tech](https://neon.tech))
 - API Keys (see `.env.example`)
 
 ### Installation
@@ -57,7 +57,7 @@ cp .env.example .env
 4. Initialize database
 ```bash
 cd backend
-npx prisma migrate dev
+npm run db:push
 cd ..
 ```
 

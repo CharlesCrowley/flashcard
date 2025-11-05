@@ -5,6 +5,27 @@ All notable changes to the ESL Flashcard App will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-11-05
+
+### Changed
+- **Database**: Migrated from Prisma to Drizzle ORM for better TypeScript support and Neon compatibility
+- **Hosting**: Configured for Neon serverless PostgreSQL instead of traditional PostgreSQL
+- **Dependencies**: Replaced `@prisma/client` and `prisma` with `drizzle-orm`, `@neondatabase/serverless`, and `drizzle-kit`
+
+### Technical Details
+- **Drizzle Schema**: Complete schema rewrite with proper indexes and relations
+- **Query Migration**: All Prisma queries converted to Drizzle's query API
+- **Type Safety**: Enhanced type inference with Drizzle's column-level types
+- **Serverless Ready**: WebSocket configuration for Neon's serverless architecture
+- **Performance**: Reduced query overhead with explicit column selection
+- **Developer Experience**: Improved with Drizzle Studio for database inspection
+
+### Migration Guide
+1. Update `DATABASE_URL` in `.env` to Neon format: `postgresql://user:password@hostname.neon.tech/db?sslmode=require`
+2. Run `npm install` in backend directory to install new dependencies
+3. Run `npm run db:push` to push schema to Neon database
+4. All API endpoints remain unchanged (backwards compatible)
+
 ## [1.0.0] - 2025-11-05
 
 ### Added
